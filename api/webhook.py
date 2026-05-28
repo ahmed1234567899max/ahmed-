@@ -1,109 +1,72 @@
 import os
-import json
 import asyncio
-import logging
-from http.server import BaseHTTPRequestHandler
-from telegram import Update, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application
+from flask import Flask, request
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 
-# تفعيل السجلات لمراقبة أداء البوت سحابياً
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# إعداد تطبيق Flask
+app = Flask(__name__)
 
-# جلب المفاتيح الحساسة من متغيرات البيئة السحابية (Vercel Environment Variables)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# جلب المتغيرات البيئية
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-# قم بوضع رقم الـ ID الخاص بحسابك التليجرام الشخصي هنا كقيمة افتراضية أو في متغيرات البيئة لكي تصلك السندات عليه
-MY_TELEGRAM_ID = int(os.getenv("MY_TELEGRAM_ID", "123456789")) 
+# إعداد عميل جيميناي الحديث
+ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# تهيئة تطبيقات التليجرام و Gemini API باستخدام المكتبات الرسمية الحديثة
-tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# بناء تطبيق تليجرام بدون بدء تشغيله كخادم مستقل
+telegram_app = Application.builder().token(TOKEN).build()
 
-# محاكاة لقاعدة بيانات فحص المشتركين (في المشروع الحقيقي يفضل ربطها بـ Supabase أو Firebase)
-# لغرض التجربة البداية: حسابك أنت كمدير يتجاوز الدفع دائماً
-def is_user_subscribed(user_id):
-    return user_id == MY_TELEGRAM_ID
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("أهلاً بك! أرسل لي أي بصمة صوتية أو ملف صوتي وسأقوم بتفريغه وتلخيصه لك فوراً. 🎙️")
 
-async def process_telegram_update(update_dict: dict):
-    """المعالج السحابي الذكي لكل الرسائل والمدفوعات القادمة من تليجرام"""
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_message = await update.message.reply_text("⏳ جاري الاستماع وتفريغ النص الآن...")
+    
     try:
-        update = Update.de_json(update_dict, tg_app.bot)
-        if not update:
-            return
-
-        # 1. معالجة الدفع الناجح آلياً بنجوم تليجرام (Automatic Payment)
-        if update.message and update.message.successful_payment:
-            user = update.message.from_user
-            # إرسال رسالة ترحيبية وتأكيدية للعميل فوراً
-            await tg_app.bot.send_message(
-                chat_id=user.id,
-                text="🎉 شكراً لك! تم تفعيل اشتراكك التلقائي عبر النجوم بنجاح.\nيمكنك الآن إرسال الملفات الصوتية والبصمات وتفريغها بلا حدود (باقة الساعة)."
-            )
-            # إرسال إشعار مالي لك على حسابك الشخصي
-            await tg_app.bot.send_message(
-                chat_id=MY_TELEGRAM_ID,
-                text=f"🔥 اشتراك تلقائي جديد!\n👤 العميل: {user.full_name}\n🆔 الآيدي: `{user.id}`\n🌟 الطريقة: نجوم تليجرام (100 نجمة)"
-            )
-            return
-
-        # 2. الموافقة التلقائية على فحص الفاتورة قبل الدفع (PreCheckout)
-        if update.pre_checkout_query:
-            await update.pre_checkout_query.answer(ok=True)
-            return
-
-        if not update.message:
-            return
-
-        message = update.message
-        user_id = message.chat_id
-
-        # 3. استقبال صورة سند التحويل المحلي (الكريمي / القطيبي) من العميل غير المشترك
-        if message.photo and not is_user_subscribed(user_id):
-            # إنشاء أزرار تحكم تظهر لك أنت فقط في محادثتك الخاصة لتفعيل العميل بنقرة واحدة
-            keyboard = [
-                [InlineKeyboardButton("✅ تفعيل الاشتراك للعميل", callback_data=f"activate_{user_id}")],
-                [InlineKeyboardButton("❌ رفض السند والإشعار", callback_data=f"reject_{user_id}")]
+        # 1. تحميل الملف الصوتي من تليجرام
+        audio_file = await update.message.voice.get_file() if update.message.voice else await update.message.audio.get_file()
+        file_bytes = await audio_file.download_as_bytearray()
+        
+        # 2. إرسال الصوت مباشرة إلى جيميناي لمعالجته وتفريغه
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                genai.types.Part.from_bytes(
+                    data=bytes(file_bytes),
+                    mime_type="audio/ogg" if update.message.voice else "audio/mp3"
+                ),
+                "قم بتفريغ هذا الصوت بدقة وكتابة النص كاملاً مع تنسيقه."
             ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            # إعادة توجيه السند فوراً إلى حسابك الشخصي على تليجرام
-            await tg_app.bot.send_photo(
-                chat_id=MY_TELEGRAM_ID,
-                photo=message.photo[-1].file_id,
-                caption=f"📩 **سند تحويل محلي جديد قيد المراجعة:**\n\n👤 العميل: {message.from_user.full_name}\n🆔 الآيدي: `{user_id}`\n\nتأكد من حسابك البنكي ثم اضغط تفعيل لفتح البوت له.",
-                reply_markup=reply_markup
-            )
-            
-            await message.reply_text("⏳ تم استلام صورة السند بنجاح. جاري مراجعته وتطابقه من قبل الإدارة وتفعيل حسابك خلال دقائق معدودة.")
-            return
+        )
+        
+        # 3. إرسال النتيجة النهائية للمستخدم
+        await status_message.edit_text(response.text)
+        
+    except Exception as e:
+        await status_message.edit_text(f"❌ حدث خطأ أثناء معالجة الطلب: {str(e)}")
 
-        # 4. معالجة أوامر البوت الأساسية
-        if message.text == "/start":
-            await message.reply_text(
-                f"👋 مرحباً بك {message.from_user.first_name} في بوت التفريغ الصوتي الاحترافي!\n\n"
-                "قم بإرسال أي رسالة صوتية (Voice Note) أو ملف صوتي (Audio) "
-                "وسأقوم بتحويله إلى نص مكتوب بدقة متناهية وبنفس اللهجة وبدون أي تحريف باستخدام ذكاء Gemini الاصطناعي الحديث."
-            )
-            return
+# ربط الأوامر والرسائل بالكود
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
 
-        # 5. التحقق من حالة اشتراك العميل قبل معالجة ملفه الصوتي
-        if (message.voice or message.audio) and not is_user_subscribed(user_id):
-            # إظهار أزرار الدفع والتسعيرة المحددة بدقة
-            keyboard = [
-                [InlineKeyboardButton("🌟 تفعيل فوري تلقائي (100 نجمة)", callback_data="buy_stars")],
-                [InlineKeyboardButton("🏦 تحويل محلي (كريمي / قطيبي)", callback_data="local_bank")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await message.reply_text(
-                "⚠️ عذراً، الخدمة مدفوعة. يرجى اختيار طريقة الاشتراك وتفعيل رصيدك للبدء في تفريغ ملفك الصوتي:",
-                reply_markup=reply_markup
-            )
-            return
-
-        # 6. تفريغ الملف الصوتي إذا كان العميل مشتركاً (باستخدام gemini-2.5-flash)
+@app.route('/api/webhook', methods=['POST'])
+def handler():
+    # حل مشكلة Event loop is closed في بيئة سحابية مثل Vercel
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        # تشغيل المعالجة بشكل آمن داخل الـ loop الحالي
+        loop.run_until_complete(telegram_app.initialize())
+        loop.run_until_complete(telegram_app.process_update(update))
+        return "OK", 200
+    return "Method Not Allowed", 405
         if (message.voice or message.audio) and is_user_subscribed(user_id):
             status_msg = await tg_app.bot.send_message(chat_id=user_id, text="⏳ جاري الاستماع وتفريغ النص الآن...")
             
